@@ -50,22 +50,16 @@ elif git rev-parse --git-dir > /dev/null 2>&1; then
   fi
 fi
 
-# ── Bar with optional pacing target marker ───────────────────────────────────
-# Usage: make_bar <pct> [target_pct] [width=12]
+# ── Progress bar with diamond boundary marker ────────────────────────────────
+# Usage: make_bar <pct> [width=12]
 make_bar() {
-  local pct=$1 target=${2:-} width=${3:-12}
+  local pct=$1 width=${2:-12}
   local filled=$(( (pct * width + 50) / 100 ))
   [ "$filled" -gt "$width" ] && filled=$width
 
-  local target_pos=-1
-  if [ -n "$target" ] && [ "$target" -ge 0 ] 2>/dev/null && [ "$target" -lt 100 ]; then
-    target_pos=$(( (target * width + 50) / 100 ))
-    [ "$target_pos" -gt "$width" ] && target_pos=$width
-  fi
-
   local bar=""
   for ((i=0; i<width; i++)); do
-    if [ "$i" -eq "$target_pos" ]; then
+    if [ "$i" -eq "$filled" ] && [ "$filled" -gt 0 ] && [ "$filled" -lt "$width" ]; then
       bar="${bar}◆"
     elif [ "$i" -lt "$filled" ]; then
       bar="${bar}▰"
@@ -88,7 +82,7 @@ color_for_pct() {
 }
 
 CTX_COLOR=$(color_for_pct "$context_pct")
-CTX_BAR=$(make_bar "$context_pct" "")
+CTX_BAR=$(make_bar "$context_pct")
 
 # ── Fetch real usage from Anthropic API ──────────────────────────────────────
 USAGE_CACHE="/tmp/claude-statusline-usage.json"
@@ -120,11 +114,9 @@ if [ ! -f "$USAGE_CACHE" ] || [ $(($(date +%s) - $(stat -f%m "$USAGE_CACHE" 2>/d
   fetch_usage 2>/dev/null
 fi
 
-# ── Parse usage data & compute pacing targets ───────────────────────────────
+# ── Parse usage data ──────────────────────────────────────────────────────
 usage_5h=""
 usage_7d=""
-target_5h=""
-target_7d=""
 resets_5h_label=""
 resets_7d_label=""
 
@@ -132,43 +124,23 @@ if [ -f "$USAGE_CACHE" ]; then
   usage_5h=$(jq -r '.five_hour.utilization // empty' "$USAGE_CACHE" 2>/dev/null | cut -d. -f1)
   usage_7d=$(jq -r '.seven_day.utilization // empty' "$USAGE_CACHE" 2>/dev/null | cut -d. -f1)
 
-  NOW_EPOCH=$(date +%s)
-
-  # 5-hour window pacing target
+  # 5-hour reset label
   resets_5h=$(jq -r '.five_hour.resets_at // empty' "$USAGE_CACHE" 2>/dev/null)
   if [ -n "$resets_5h" ]; then
     reset_epoch=$(date -juf "%Y-%m-%dT%H:%M:%S" "$(echo "$resets_5h" | cut -d. -f1 | sed 's/+.*//')" +%s 2>/dev/null)
-
     if [ -n "$reset_epoch" ]; then
-      window_secs=$((5 * 3600))
-      start_epoch=$((reset_epoch - window_secs))
-      elapsed=$((NOW_EPOCH - start_epoch))
-      [ "$elapsed" -lt 0 ] && elapsed=0
-      [ "$elapsed" -gt "$window_secs" ] && elapsed=$window_secs
-      target_5h=$(( (elapsed * 100 + window_secs / 2) / window_secs ))
-
-      # Human-readable reset label (e.g. "3pm")
       resets_5h_label=$(date -r "$(( (reset_epoch + 1800) / 3600 * 3600 ))" '+%-l%p' 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d ' ')
     fi
   fi
 
-  # 7-day window pacing target
+  # 7-day reset label
   resets_7d=$(jq -r '.seven_day.resets_at // empty' "$USAGE_CACHE" 2>/dev/null)
   if [ -n "$resets_7d" ]; then
     reset_epoch=$(date -juf "%Y-%m-%dT%H:%M:%S" "$(echo "$resets_7d" | cut -d. -f1 | sed 's/+.*//')" +%s 2>/dev/null)
-
     if [ -n "$reset_epoch" ]; then
-      window_secs=$((7 * 86400))
-      start_epoch=$((reset_epoch - window_secs))
-      elapsed=$((NOW_EPOCH - start_epoch))
-      [ "$elapsed" -lt 0 ] && elapsed=0
-      [ "$elapsed" -gt "$window_secs" ] && elapsed=$window_secs
-      target_7d=$(( (elapsed * 100 + window_secs / 2) / window_secs ))
-
-      # Human-readable reset label (e.g. "Fri,9pm") — build day + time separately
       _snap=$(( (reset_epoch + 1800) / 3600 * 3600 ))
-      _day=$(date -r "$_snap" '+%a' 2>/dev/null)           # "Fri" (already title-case)
-      _time=$(date -r "$_snap" '+%-l%p' 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d ' ')  # "9pm"
+      _day=$(date -r "$_snap" '+%a' 2>/dev/null)
+      _time=$(date -r "$_snap" '+%-l%p' 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d ' ')
       resets_7d_label="${_day},${_time}"
     fi
   fi
@@ -179,15 +151,15 @@ usage_parts=""
 
 if [ -n "$usage_5h" ]; then
   U5_COLOR=$(color_for_pct "$usage_5h")
-  U5_BAR=$(make_bar "$usage_5h" "$target_5h")
-  usage_parts="${U5_COLOR}♻${resets_5h_label} ${U5_BAR} ${usage_5h}%\\033[0m"
+  U5_BAR=$(make_bar "$usage_5h")
+  usage_parts="${U5_COLOR}${resets_5h_label} ${U5_BAR} ${usage_5h}%\\033[0m"
 fi
 
 if [ -n "$usage_7d" ]; then
   U7_COLOR=$(color_for_pct "$usage_7d")
-  U7_BAR=$(make_bar "$usage_7d" "$target_7d")
+  U7_BAR=$(make_bar "$usage_7d")
   [ -n "$usage_parts" ] && usage_parts="${usage_parts}\\033[2m │ \\033[0m"
-  usage_parts="${usage_parts}${U7_COLOR}♻${resets_7d_label} ${U7_BAR} ${usage_7d}%\\033[0m"
+  usage_parts="${usage_parts}${U7_COLOR}${resets_7d_label} ${U7_BAR} ${usage_7d}%\\033[0m"
 fi
 
 # ── Build model label (name + pricing if known) ─────────────────────────────
