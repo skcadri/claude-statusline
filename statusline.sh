@@ -91,10 +91,18 @@ USAGE_CACHE_AGE=60
 fetch_usage() {
   local creds token response
 
-  # macOS: read OAuth token from Keychain
-  creds=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) || return 1
+  # Prefer file-based credentials (~/.claude/.credentials.json); newer Claude
+  # Code versions store the OAuth token here instead of the macOS Keychain.
+  if [ -f ~/.claude/.credentials.json ]; then
+    token=$(jq -r '.claudeAiOauth.accessToken // empty' ~/.claude/.credentials.json 2>/dev/null)
+  fi
 
-  token=$(echo "$creds" | jq -r '.claudeAiOauth.accessToken') || return 1
+  # Fall back to the macOS Keychain if no file token was found.
+  if [ -z "$token" ] || [ "$token" = "null" ]; then
+    creds=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
+    token=$(echo "$creds" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
+  fi
+
   [ -z "$token" ] || [ "$token" = "null" ] && return 1
 
   response=$(curl -s --max-time 3 "https://api.anthropic.com/api/oauth/usage" \

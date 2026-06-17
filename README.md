@@ -47,7 +47,7 @@ chmod +x ~/.claude/statusline.sh
 
 The script reads the JSON context that Claude Code pipes to status line commands, then fetches your actual usage data from the Anthropic OAuth API (`https://api.anthropic.com/api/oauth/usage`). Results are cached for 60 seconds to avoid excessive API calls.
 
-The OAuth token is read from your macOS Keychain (stored by Claude Code when you log in).
+The OAuth token is read from `~/.claude/.credentials.json` (where newer Claude Code versions store it), falling back to the macOS Keychain for older installs.
 
 ## Model pricing
 
