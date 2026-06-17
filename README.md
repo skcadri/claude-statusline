@@ -6,17 +6,18 @@ A custom status line for [Claude Code](https://docs.anthropic.com/en/docs/claude
 
 ## What it shows
 
-**Line 1:** Directory | Git branch | Model name + input/output pricing per 1M tokens | Context window bar
+**Line 1:** Directory | Git branch | Model name | Context window bar
 
-**Line 2:** 5-hour rolling usage bar with reset time | 7-day usage bar with reset time
+**Line 2:** `5h` rolling usage bar with reset time | `wk` 7-day usage bar with reset time
 
 - `▰▱` progress bars with color coding (green < 50%, yellow 50-80%, red > 80%)
-- `◆` pacing marker shows where usage *should* be for even distribution across the window
-- `♻` followed by the reset time for each window
+- `◇` pacing marker shows where you'd be at an even burn rate across the window — if the fill runs **past** the `◇`, you're spending faster than the clock
+- `⟳` followed by the reset time for each window
+- Bars are labeled (`ctx` / `5h` / `wk`) and percentages are bolded so your eye lands on the number that matters
 
 ## Requirements
 
-- macOS (uses Keychain for OAuth credentials)
+- macOS (reads OAuth credentials from `~/.claude/.credentials.json`, Keychain fallback)
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI
 - `jq` and `curl`
 
@@ -48,16 +49,6 @@ chmod +x ~/.claude/statusline.sh
 The script reads the JSON context that Claude Code pipes to status line commands, then fetches your actual usage data from the Anthropic OAuth API (`https://api.anthropic.com/api/oauth/usage`). Results are cached for 60 seconds to avoid excessive API calls.
 
 The OAuth token is read from `~/.claude/.credentials.json` (where newer Claude Code versions store it), falling back to the macOS Keychain for older installs.
-
-## Model pricing
-
-The status line shows input/output token costs per 1M tokens for the active model:
-
-| Model | Displayed |
-|-------|-----------|
-| Opus 4.6 | `$15/$75` |
-| Sonnet 4.6 | `$3/$15` |
-| Haiku 4.5 | `$0.8/$4` |
 
 ## Credits
 
