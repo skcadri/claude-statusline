@@ -4,15 +4,29 @@
 # Based on https://gist.github.com/jtbr/4f99671d1cee06b44106456958caba8b
 #
 # Shows: dir · git · cost/model · context bar · 5hr usage bar · weekly usage bar
-# Usage data is fetched from the Anthropic OAuth API and cached for 60s.
+# Usage limits come from the `rate_limits` field Claude Code pipes on stdin.
+# Older Claude Code versions don't send it; then usage is fetched from the
+# Anthropic OAuth API and cached for 60s.
+#
+# Works on macOS (BSD date/stat) and Linux (GNU coreutils).
+#
+# Options (env vars):
+#   STATUSLINE_PACE=1  put the ◆ at the even-burn position for each usage
+#                      window instead of at the fill edge — fill running past
+#                      the ◆ means you're spending faster than the clock.
 
 input=$(cat)
+now=$(date +%s)
 
 # ── Parse input ──────────────────────────────────────────────────────────────
 model_name=$(echo "$input" | jq -r '.model.display_name // "Claude"')
 model_id=$(echo "$input" | jq -r '.model.id // ""')
 current_dir=$(echo "$input" | jq -r '.workspace.current_dir // ""')
 context_pct=$(echo "$input" | jq -r '.context_window.used_percentage // 10' | cut -d. -f1)
+stdin_5h=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty' | cut -d. -f1)
+stdin_5h_reset=$(echo "$input" | jq -r '.rate_limits.five_hour.resets_at // empty')
+stdin_7d=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty' | cut -d. -f1)
+stdin_7d_reset=$(echo "$input" | jq -r '.rate_limits.seven_day.resets_at // empty')
 
 # Model input/output pricing per 1M tokens
 case "$model_id" in
@@ -50,16 +64,51 @@ elif git rev-parse --git-dir > /dev/null 2>&1; then
   fi
 fi
 
-# ── Progress bar with diamond boundary marker ────────────────────────────────
-# Usage: make_bar <pct> [width=12]
+# ── Portable date/stat (GNU coreutils on Linux, BSD on macOS) ───────────────
+if date --version >/dev/null 2>&1; then
+  date_parse_iso() { date -d "$1" +%s 2>/dev/null; }
+  date_fmt()       { date -d "@$1" "$2" 2>/dev/null; }
+  file_mtime()     { stat -c %Y "$1" 2>/dev/null; }
+else
+  date_parse_iso() { date -juf "%Y-%m-%dT%H:%M:%S" "$(echo "$1" | cut -d. -f1 | sed 's/+.*//')" +%s 2>/dev/null; }
+  date_fmt()       { date -r "$1" "$2" 2>/dev/null; }
+  file_mtime()     { stat -f %m "$1" 2>/dev/null; }
+fi
+
+# epoch_of <resets_at> — stdin sends epoch seconds, the OAuth API sends RFC 3339
+epoch_of() {
+  case "$1" in
+    ''|*[!0-9.]*) date_parse_iso "$1" ;;
+    *)            echo "${1%%.*}" ;;
+  esac
+}
+
+# pace_pct <reset_epoch> <window_seconds> — how far through the window we are
+pace_pct() {
+  local p=$(( (now - $1 + $2) * 100 / $2 ))
+  [ "$p" -lt 0 ] && p=0; [ "$p" -gt 100 ] && p=100
+  echo "$p"
+}
+
+# ── Progress bar with diamond marker ─────────────────────────────────────────
+# Usage: make_bar <pct> [pace_pct] [width=12]
+#   Without pace_pct the ◆ marks the fill edge; with it, the even-burn position.
 make_bar() {
-  local pct=$1 width=${2:-12}
+  local pct=$1 pace=$2 width=${3:-12}
   local filled=$(( (pct * width + 50) / 100 ))
   [ "$filled" -gt "$width" ] && filled=$width
 
+  local marker=-1
+  if [ -n "$pace" ]; then
+    marker=$(( pace * width / 100 ))
+    [ "$marker" -ge "$width" ] && marker=$((width - 1))
+  elif [ "$filled" -gt 0 ] && [ "$filled" -lt "$width" ]; then
+    marker=$filled
+  fi
+
   local bar=""
   for ((i=0; i<width; i++)); do
-    if [ "$i" -eq "$filled" ] && [ "$filled" -gt 0 ] && [ "$filled" -lt "$width" ]; then
+    if [ "$i" -eq "$marker" ]; then
       bar="${bar}◆"
     elif [ "$i" -lt "$filled" ]; then
       bar="${bar}▰"
@@ -117,40 +166,50 @@ fetch_usage() {
   echo "$response" > "$USAGE_CACHE"
 }
 
-# Refresh cache if stale or missing (macOS stat uses -f%m)
-if [ ! -f "$USAGE_CACHE" ] || [ $(($(date +%s) - $(stat -f%m "$USAGE_CACHE" 2>/dev/null || echo 0))) -gt $USAGE_CACHE_AGE ]; then
-  fetch_usage 2>/dev/null
-fi
+# ── Usage data: stdin first, OAuth API fallback ─────────────────────────────
+usage_5h="$stdin_5h"
+usage_7d="$stdin_7d"
+resets_5h="$stdin_5h_reset"
+resets_7d="$stdin_7d_reset"
 
-# ── Parse usage data ──────────────────────────────────────────────────────
-usage_5h=""
-usage_7d=""
-resets_5h_label=""
-resets_7d_label=""
-
-if [ -f "$USAGE_CACHE" ]; then
-  usage_5h=$(jq -r '.five_hour.utilization // empty' "$USAGE_CACHE" 2>/dev/null | cut -d. -f1)
-  usage_7d=$(jq -r '.seven_day.utilization // empty' "$USAGE_CACHE" 2>/dev/null | cut -d. -f1)
-
-  # 5-hour reset label
-  resets_5h=$(jq -r '.five_hour.resets_at // empty' "$USAGE_CACHE" 2>/dev/null)
-  if [ -n "$resets_5h" ]; then
-    reset_epoch=$(date -juf "%Y-%m-%dT%H:%M:%S" "$(echo "$resets_5h" | cut -d. -f1 | sed 's/+.*//')" +%s 2>/dev/null)
-    if [ -n "$reset_epoch" ]; then
-      resets_5h_label=$(date -r "$(( (reset_epoch + 1800) / 3600 * 3600 ))" '+%-l%p' 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d ' ')
-    fi
+if [ -z "$usage_5h" ] && [ -z "$usage_7d" ]; then
+  # Refresh cache if stale or missing
+  if [ ! -f "$USAGE_CACHE" ] || [ $(( now - $(file_mtime "$USAGE_CACHE" || echo 0) )) -gt $USAGE_CACHE_AGE ]; then
+    fetch_usage 2>/dev/null
   fi
 
-  # 7-day reset label
-  resets_7d=$(jq -r '.seven_day.resets_at // empty' "$USAGE_CACHE" 2>/dev/null)
-  if [ -n "$resets_7d" ]; then
-    reset_epoch=$(date -juf "%Y-%m-%dT%H:%M:%S" "$(echo "$resets_7d" | cut -d. -f1 | sed 's/+.*//')" +%s 2>/dev/null)
-    if [ -n "$reset_epoch" ]; then
-      _snap=$(( (reset_epoch + 1800) / 3600 * 3600 ))
-      _day=$(date -r "$_snap" '+%a' 2>/dev/null)
-      _time=$(date -r "$_snap" '+%-l%p' 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d ' ')
-      resets_7d_label="${_day},${_time}"
-    fi
+  if [ -f "$USAGE_CACHE" ]; then
+    usage_5h=$(jq -r '.five_hour.utilization // empty' "$USAGE_CACHE" 2>/dev/null | cut -d. -f1)
+    usage_7d=$(jq -r '.seven_day.utilization // empty' "$USAGE_CACHE" 2>/dev/null | cut -d. -f1)
+    resets_5h=$(jq -r '.five_hour.resets_at // empty' "$USAGE_CACHE" 2>/dev/null)
+    resets_7d=$(jq -r '.seven_day.resets_at // empty' "$USAGE_CACHE" 2>/dev/null)
+  fi
+fi
+
+# ── Reset labels (and pacing, when enabled) ─────────────────────────────────
+resets_5h_label=""
+resets_7d_label=""
+pace_5h=""
+pace_7d=""
+
+# 5-hour reset label
+if [ -n "$resets_5h" ]; then
+  reset_epoch=$(epoch_of "$resets_5h")
+  if [ -n "$reset_epoch" ]; then
+    resets_5h_label=$(date_fmt "$(( (reset_epoch + 1800) / 3600 * 3600 ))" '+%-l%p' | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+    [ "$STATUSLINE_PACE" = 1 ] && pace_5h=$(pace_pct "$reset_epoch" 18000)
+  fi
+fi
+
+# 7-day reset label
+if [ -n "$resets_7d" ]; then
+  reset_epoch=$(epoch_of "$resets_7d")
+  if [ -n "$reset_epoch" ]; then
+    _snap=$(( (reset_epoch + 1800) / 3600 * 3600 ))
+    _day=$(date_fmt "$_snap" '+%a')
+    _time=$(date_fmt "$_snap" '+%-l%p' | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+    resets_7d_label="${_day},${_time}"
+    [ "$STATUSLINE_PACE" = 1 ] && pace_7d=$(pace_pct "$reset_epoch" 604800)
   fi
 fi
 
@@ -159,13 +218,13 @@ usage_parts=""
 
 if [ -n "$usage_5h" ]; then
   U5_COLOR=$(color_for_pct "$usage_5h")
-  U5_BAR=$(make_bar "$usage_5h")
+  U5_BAR=$(make_bar "$usage_5h" "$pace_5h")
   usage_parts="${U5_COLOR}${resets_5h_label} ${U5_BAR} ${usage_5h}%\\033[0m"
 fi
 
 if [ -n "$usage_7d" ]; then
   U7_COLOR=$(color_for_pct "$usage_7d")
-  U7_BAR=$(make_bar "$usage_7d")
+  U7_BAR=$(make_bar "$usage_7d" "$pace_7d")
   [ -n "$usage_parts" ] && usage_parts="${usage_parts}\\033[2m │ \\033[0m"
   usage_parts="${usage_parts}${U7_COLOR}${resets_7d_label} ${U7_BAR} ${usage_7d}%\\033[0m"
 fi
