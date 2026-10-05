@@ -1,35 +1,37 @@
 # Claude Code Statusline
 
-A custom status line for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) that shows **real usage limits** from the Anthropic API with visual progress bars.
+A two-line status line for [Claude Code](https://code.claude.com/docs/en/statusline): where you are (repo, worktree, branch, PR), which model and effort, how full the context is, and how much of your 5-hour and weekly limits you've used.
 
 ![statusline](screenshot.png)
 
 ## What it shows
 
-**Line 1:** Directory | Git branch | Model name + input/output pricing per 1M tokens | Context window bar
+**Line 1:** `repo[/worktree][/subdir] branch* ↑ahead ↓behind #PR │ model effort ⚡ │ context bar`
 
-**Line 2:** 5-hour rolling usage bar with reset time | 7-day usage bar with reset time
+- The repo is named after its folder. Inside a linked worktree (e.g. `.claude/worktrees/fix-login`) the worktree name follows in magenta, and the branch is left out when it's just the worktree's own (`fix-login` or `worktree-fix-login`).
+- `*` uncommitted changes to tracked files; `↑`/`↓` commits ahead of / behind upstream.
+- `#42` is the open PR for the branch: green `✓` approved, red `✗` changes requested, yellow awaiting review, dim `draft`. Cmd-click opens it (iTerm2, Kitty, WezTerm).
+- Effort level as set by `/effort`; `⚡` in fast mode.
+- Context window bar. `cache cold` appears once the prompt cache has expired, meaning the next message re-processes the whole context.
 
-- `▰▱` progress bars with color coding (green < 50%, yellow 50-80%, red > 80%)
-- `◆` pacing marker shows where usage *should* be for even distribution across the window
-- `♻` followed by the reset time for each window
+**Line 2:** 5-hour usage bar with the hour it resets │ weekly usage bar with the day and hour it resets.
+
+Bars: `▰` used, `▱` remaining, `◆` fill edge. Green below 50%, yellow 50–80%, red from 80%.
 
 ## Requirements
 
-- macOS (uses Keychain for OAuth credentials)
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI
-- `jq` and `curl`
+- macOS (uses BSD `date -r`)
+- Claude Code with a Pro or Max plan (the usage line needs `rate_limits` in the status line input)
+- `jq`, and git 2.31+
 
 ## Install
 
-1. Copy the script to your Claude config directory:
-
 ```bash
-cp statusline.sh ~/.claude/statusline.sh
-chmod +x ~/.claude/statusline.sh
+git clone https://github.com/skcadri/claude-statusline ~/code/claude-statusline
+ln -sf ~/code/claude-statusline/statusline.sh ~/.claude/statusline.sh
 ```
 
-2. Add to your `~/.claude/settings.json`:
+Then in `~/.claude/settings.json`:
 
 ```json
 {
@@ -41,23 +43,21 @@ chmod +x ~/.claude/statusline.sh
 }
 ```
 
-3. Restart Claude Code. The status line appears automatically.
+Because it's a symlink, `git pull` updates the status line in every running session.
+
+## Preview
+
+```bash
+./preview.sh
+```
+
+Renders every state (new session, mid-session, worktree with PR, cold cache, heavy usage, outside git) against a throwaway git repo. No Claude Code session needed, and your real usage cache isn't touched.
 
 ## How it works
 
-The script reads the JSON context that Claude Code pipes to status line commands, then fetches your actual usage data from the Anthropic OAuth API (`https://api.anthropic.com/api/oauth/usage`). Results are cached for 60 seconds to avoid excessive API calls.
+Claude Code pipes [session JSON](https://code.claude.com/docs/en/statusline#available-data) to the script on every refresh. The script reads it with one `jq` call and runs two fast git commands (`rev-parse`, then `status --no-optional-locks` so it never fights a background agent for `index.lock`). There are no network calls and no OAuth token handling.
 
-The OAuth token is read from `~/.claude/.credentials.json` (where newer Claude Code versions store it), falling back to the macOS Keychain for older installs.
-
-## Model pricing
-
-The status line shows input/output token costs per 1M tokens for the active model:
-
-| Model | Displayed |
-|-------|-----------|
-| Opus 4.6 | `$15/$75` |
-| Sonnet 4.6 | `$3/$15` |
-| Haiku 4.5 | `$0.8/$4` |
+Usage numbers come from the `rate_limits` field, which Claude Code only includes after a session's first API response. So each session merges what it sees into `/tmp/claude-statusline-limits.json`, and a fresh or `/clear`ed session reads from there. Usage only grows within a window, so the higher number wins, and windows past their reset time are dropped.
 
 ## Credits
 

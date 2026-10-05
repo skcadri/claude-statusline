@@ -1,53 +1,108 @@
 #!/bin/bash
 
-# Claude Code Status Line — Real usage limits from Anthropic API
+# Claude Code Status Line
 # Based on https://gist.github.com/jtbr/4f99671d1cee06b44106456958caba8b
 #
-# Shows: dir · git · cost/model · context bar · 5hr usage bar · weekly usage bar
-# Usage data is fetched from the Anthropic OAuth API and cached for 60s.
+# Line 1: repo[/worktree][/subdir] · branch* ↑ahead ↓behind · PR · model + effort · context bar
+# Line 2: 5-hour and weekly usage bars with reset times
+#
+# Everything comes from the JSON Claude Code pipes on stdin plus two local git
+# calls. No network, no OAuth token.
 
 input=$(cat)
+now=$(date +%s)
 
-# ── Parse input ──────────────────────────────────────────────────────────────
-model_name=$(echo "$input" | jq -r '.model.display_name // "Claude"')
-model_id=$(echo "$input" | jq -r '.model.id // ""')
-current_dir=$(echo "$input" | jq -r '.workspace.current_dir // ""')
-context_pct=$(echo "$input" | jq -r '.context_window.used_percentage // 10' | cut -d. -f1)
+R=$'\e[0m' DIM=$'\e[2m' CYAN=$'\e[96m' MAGENTA=$'\e[35m' BLUE=$'\e[94m'
+GREEN=$'\e[32m' YELLOW=$'\e[33m' RED=$'\e[91m'
 
-# Model input/output pricing per 1M tokens
-case "$model_id" in
-  *opus-4*)   model_price="\$15/\$75" ;;
-  *sonnet-4*) model_price="\$3/\$15"  ;;
-  *haiku-4*)  model_price="\$0.8/\$4" ;;
-  *)          model_price=""           ;;
-esac
+# stdin only carries rate_limits after a session's first API response, so a new
+# or /clear'd session would show no usage line. Every session merges what it
+# sees into one shared file; usage only grows within a window, so the later
+# window or the higher percentage wins.
+LIMITS_FILE="${CLAUDE_STATUSLINE_LIMITS:-/tmp/claude-statusline-limits.json}"
 
-if [ -n "$current_dir" ]; then
-  dir_name=$(basename "$current_dir")
-else
-  dir_name=$(basename "$(pwd)")
+# ── Parse input (one jq call) ────────────────────────────────────────────────
+eval "$(jq -r --argjson now "$now" --arg cached "$(cat "$LIMITS_FILE" 2>/dev/null)" '
+  def live: if . != null and (.resets_at // 0) > $now then . else null end;
+  def newer(a; b):
+    if a == null then b elif b == null then a
+    elif ((a.resets_at - b.resets_at) | fabs) > 600 then (if a.resets_at > b.resets_at then a else b end)
+    elif a.used_percentage >= b.used_percentage then a else b end;
+  def pct: if . == null then "" else floor end;
+
+  ($cached | fromjson? // {}) as $c
+  | (.rate_limits // {}) as $s
+  | { five_hour: newer($s.five_hour | live; $c.five_hour | live),
+      seven_day: newer($s.seven_day | live; $c.seven_day | live) } as $lim
+  | .prompt_cache as $pc
+  | @sh "model_name=\(.model.display_name // "Claude")",
+    @sh "current_dir=\(.workspace.current_dir // .cwd // "")",
+    @sh "context_pct=\(.context_window.used_percentage // 0 | floor)",
+    @sh "effort=\(.effort.level // "")",
+    @sh "fast_mode=\(.fast_mode // false)",
+    @sh "pr_number=\(.pr.number // "")",
+    @sh "pr_url=\(.pr.url // "")",
+    @sh "pr_state=\(.pr.review_state // "")",
+    @sh "cache_cold=\($pc.caching_observed == true and (($pc.warm == true and ($pc.expires_at // 0) > $now) | not))",
+    @sh "usage_5h=\($lim.five_hour.used_percentage | pct)",
+    @sh "resets_5h=\($lim.five_hour.resets_at // "")",
+    @sh "usage_7d=\($lim.seven_day.used_percentage | pct)",
+    @sh "resets_7d=\($lim.seven_day.resets_at // "")",
+    @sh "limits_out=\(if .rate_limits then $lim | tojson else "" end)"
+' <<<"$input")"
+
+if [ -n "$limits_out" ]; then
+  printf '%s' "$limits_out" > "$LIMITS_FILE.$$" && mv -f "$LIMITS_FILE.$$" "$LIMITS_FILE"
 fi
 
-# ── Git info ─────────────────────────────────────────────────────────────────
-git_info=""
-if [ -n "$current_dir" ]; then
-  branch=$(git -C "$current_dir" branch --show-current 2>/dev/null || git -C "$current_dir" rev-parse --short HEAD 2>/dev/null)
-  if [ -n "$branch" ]; then
-    if ! git -C "$current_dir" diff --quiet 2>/dev/null || ! git -C "$current_dir" diff --cached --quiet 2>/dev/null; then
-      git_info=" ${branch}*"
-    else
-      git_info=" ${branch}"
-    fi
+# ── Location + git (rev-parse for paths, one status call for the rest) ──────
+gdir="${current_dir:-$PWD}"
+label=$(basename "$gdir")
+wt="" wt_label="" sub_label="" git_info=""
+
+if paths=$(git -C "$gdir" rev-parse --path-format=absolute --show-toplevel --git-common-dir --show-prefix 2>/dev/null); then
+  { read -r toplevel; read -r common; read -r prefix; } <<<"$paths"
+
+  # Name the repo after its folder (what you cd into), not the origin remote.
+  if [[ "$common" == */.git ]]; then
+    label=$(basename "${common%/.git}")
+    [ "$common" != "$toplevel/.git" ] && wt=$(basename "$toplevel") && wt_label="/$wt"
+  else
+    label=$(basename "$toplevel")
   fi
-elif git rev-parse --git-dir > /dev/null 2>&1; then
-  branch=$(git branch --show-current 2>/dev/null || git rev-parse --short HEAD 2>/dev/null)
-  if [ -n "$branch" ]; then
-    if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
-      git_info=" ${branch}*"
-    else
-      git_info=" ${branch}"
-    fi
-  fi
+  [ -n "$prefix" ] && sub_label="/${prefix%/}"
+
+  # --no-optional-locks: don't take index.lock while background agents commit
+  branch="" oid="" ahead=0 behind=0 dirty=""
+  while IFS= read -r line; do
+    case "$line" in
+      "# branch.oid "*)  oid=${line#\# branch.oid } ;;
+      "# branch.head "*) branch=${line#\# branch.head } ;;
+      "# branch.ab "*)   read -r ahead behind <<<"${line#\# branch.ab }"; ahead=${ahead#+}; behind=${behind#-} ;;
+      "#"*) ;;
+      ?*) dirty="*" ;;
+    esac
+  done < <(git -C "$gdir" --no-optional-locks status --porcelain=v2 --branch --untracked-files=no 2>/dev/null)
+
+  [ "$branch" = "(detached)" ] && branch=${oid:0:7}
+  # A worktree's own branch (name or worktree-name) is already in the label.
+  [ -n "$wt" ] && { [ "$branch" = "$wt" ] || [ "$branch" = "worktree-$wt" ]; } && branch=""
+
+  git_info="${branch:+ $branch}${dirty}"
+  [ "$ahead" -gt 0 ] && git_info="${git_info} ↑${ahead}"
+  [ "$behind" -gt 0 ] && git_info="${git_info} ↓${behind}"
+fi
+
+# ── PR badge (clickable in iTerm2/Kitty/WezTerm via OSC 8) ───────────────────
+pr_info=""
+if [ -n "$pr_number" ]; then
+  case "$pr_state" in
+    approved)          pr_text="${GREEN}#${pr_number} ✓" ;;
+    changes_requested) pr_text="${RED}#${pr_number} ✗" ;;
+    draft)             pr_text="${DIM}#${pr_number} draft" ;;
+    *)                 pr_text="${YELLOW}#${pr_number}" ;;
+  esac
+  pr_info=" "$'\e]8;;'"${pr_url}"$'\e\\'"${pr_text}"$'\e]8;;\e\\'"${R}"
 fi
 
 # ── Progress bar with diamond boundary marker ────────────────────────────────
@@ -73,115 +128,37 @@ make_bar() {
 color_for_pct() {
   local pct=$1
   if [ "$pct" -ge 80 ]; then
-    printf "\\033[91m"         # bright red
+    printf "%s" "$RED"
   elif [ "$pct" -ge 50 ]; then
-    printf "\\033[33m"         # yellow
+    printf "%s" "$YELLOW"
   else
-    printf "\\033[2m\\033[32m" # dim green
+    printf "%s" "$DIM$GREEN"
   fi
 }
 
-CTX_COLOR=$(color_for_pct "$context_pct")
-CTX_BAR=$(make_bar "$context_pct")
+# ── Model + context ──────────────────────────────────────────────────────────
+model_label="${model_name}${effort:+ ${DIM}${effort}${R}}"
+[ "$fast_mode" = "true" ] && model_label="${model_label} ${YELLOW}⚡${R}"
 
-# ── Fetch real usage from Anthropic API ──────────────────────────────────────
-USAGE_CACHE="/tmp/claude-statusline-usage.json"
-USAGE_CACHE_AGE=60
+ctx_info="$(color_for_pct "$context_pct")$(make_bar "$context_pct") ${context_pct}%${R}"
+# Cold cache: the next message re-processes the whole context.
+[ "$cache_cold" = "true" ] && ctx_info="${ctx_info} ${BLUE}cache cold${R}"
 
-fetch_usage() {
-  local creds token response
-
-  # Prefer file-based credentials (~/.claude/.credentials.json); newer Claude
-  # Code versions store the OAuth token here instead of the macOS Keychain.
-  if [ -f ~/.claude/.credentials.json ]; then
-    token=$(jq -r '.claudeAiOauth.accessToken // empty' ~/.claude/.credentials.json 2>/dev/null)
-  fi
-
-  # Fall back to the macOS Keychain if no file token was found.
-  if [ -z "$token" ] || [ "$token" = "null" ]; then
-    creds=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
-    token=$(echo "$creds" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
-  fi
-
-  [ -z "$token" ] || [ "$token" = "null" ] && return 1
-
-  response=$(curl -s --max-time 3 "https://api.anthropic.com/api/oauth/usage" \
-    -H "Authorization: Bearer $token" \
-    -H "anthropic-beta: oauth-2025-04-20" \
-    -H "Content-Type: application/json" 2>/dev/null) || return 1
-
-  if echo "$response" | jq -e '.error' >/dev/null 2>&1; then
-    return 1
-  fi
-
-  echo "$response" > "$USAGE_CACHE"
-}
-
-# Refresh cache if stale or missing (macOS stat uses -f%m)
-if [ ! -f "$USAGE_CACHE" ] || [ $(($(date +%s) - $(stat -f%m "$USAGE_CACHE" 2>/dev/null || echo 0))) -gt $USAGE_CACHE_AGE ]; then
-  fetch_usage 2>/dev/null
-fi
-
-# ── Parse usage data ──────────────────────────────────────────────────────
-usage_5h=""
-usage_7d=""
-resets_5h_label=""
-resets_7d_label=""
-
-if [ -f "$USAGE_CACHE" ]; then
-  usage_5h=$(jq -r '.five_hour.utilization // empty' "$USAGE_CACHE" 2>/dev/null | cut -d. -f1)
-  usage_7d=$(jq -r '.seven_day.utilization // empty' "$USAGE_CACHE" 2>/dev/null | cut -d. -f1)
-
-  # 5-hour reset label
-  resets_5h=$(jq -r '.five_hour.resets_at // empty' "$USAGE_CACHE" 2>/dev/null)
-  if [ -n "$resets_5h" ]; then
-    reset_epoch=$(date -juf "%Y-%m-%dT%H:%M:%S" "$(echo "$resets_5h" | cut -d. -f1 | sed 's/+.*//')" +%s 2>/dev/null)
-    if [ -n "$reset_epoch" ]; then
-      resets_5h_label=$(date -r "$(( (reset_epoch + 1800) / 3600 * 3600 ))" '+%-l%p' 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d ' ')
-    fi
-  fi
-
-  # 7-day reset label
-  resets_7d=$(jq -r '.seven_day.resets_at // empty' "$USAGE_CACHE" 2>/dev/null)
-  if [ -n "$resets_7d" ]; then
-    reset_epoch=$(date -juf "%Y-%m-%dT%H:%M:%S" "$(echo "$resets_7d" | cut -d. -f1 | sed 's/+.*//')" +%s 2>/dev/null)
-    if [ -n "$reset_epoch" ]; then
-      _snap=$(( (reset_epoch + 1800) / 3600 * 3600 ))
-      _day=$(date -r "$_snap" '+%a' 2>/dev/null)
-      _time=$(date -r "$_snap" '+%-l%p' 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d ' ')
-      resets_7d_label="${_day},${_time}"
-    fi
-  fi
-fi
-
-# ── Build usage segments ────────────────────────────────────────────────────
+# ── Usage segments ───────────────────────────────────────────────────────────
 usage_parts=""
 
 if [ -n "$usage_5h" ]; then
-  U5_COLOR=$(color_for_pct "$usage_5h")
-  U5_BAR=$(make_bar "$usage_5h")
-  usage_parts="${U5_COLOR}${resets_5h_label} ${U5_BAR} ${usage_5h}%\\033[0m"
+  label_5h=$(date -r "$(( (resets_5h + 1800) / 3600 * 3600 ))" '+%-l%p' | tr '[:upper:]' '[:lower:]')
+  usage_parts="$(color_for_pct "$usage_5h")${label_5h} $(make_bar "$usage_5h") ${usage_5h}%${R}"
 fi
 
 if [ -n "$usage_7d" ]; then
-  U7_COLOR=$(color_for_pct "$usage_7d")
-  U7_BAR=$(make_bar "$usage_7d")
-  [ -n "$usage_parts" ] && usage_parts="${usage_parts}\\033[2m │ \\033[0m"
-  usage_parts="${usage_parts}${U7_COLOR}${resets_7d_label} ${U7_BAR} ${usage_7d}%\\033[0m"
-fi
-
-# ── Build model label (name + pricing if known) ─────────────────────────────
-if [ -n "$model_price" ]; then
-  model_label="${model_name} \\033[2m${model_price}\\033[0m"
-else
-  model_label="${model_name}"
+  label_7d=$(date -r "$(( (resets_7d + 1800) / 3600 * 3600 ))" '+%a,%-l%p' | sed 's/AM$/am/;s/PM$/pm/')
+  [ -n "$usage_parts" ] && usage_parts="${usage_parts}${DIM} │ ${R}"
+  usage_parts="${usage_parts}$(color_for_pct "$usage_7d")${label_7d} $(make_bar "$usage_7d") ${usage_7d}%${R}"
 fi
 
 # ── Two-line output ──────────────────────────────────────────────────────────
-# Line 1: dir · git · model (pricing) · context bar
-echo -e "\\033[2m\\033[96m${dir_name}\\033[0m\\033[2m${git_info} │ \\033[0m${model_label}\\033[2m │ \\033[0m${CTX_COLOR}${CTX_BAR} ${context_pct}%\\033[0m"
-
-# Line 2: 5hr and weekly usage bars (only if data available)
-if [ -n "$usage_parts" ]; then
-  echo -e "$usage_parts"
-fi
+printf '%s\n' "${DIM}${CYAN}${label}${MAGENTA}${wt_label}${CYAN}${sub_label}${R}${DIM}${git_info}${R}${pr_info}${DIM} │ ${R}${model_label}${DIM} │ ${R}${ctx_info}"
+[ -n "$usage_parts" ] && printf '%s\n' "$usage_parts"
+exit 0
