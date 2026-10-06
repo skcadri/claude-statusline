@@ -12,7 +12,7 @@ A two-line status line for [Claude Code](https://code.claude.com/docs/en/statusl
 - `*` uncommitted changes to tracked files; `↑`/`↓` commits ahead of / behind upstream.
 - `#42` is the open PR for the branch: green `✓` approved, red `✗` changes requested, yellow awaiting review, dim `draft`. Cmd-click opens it (iTerm2, Kitty, WezTerm).
 - Effort level as set by `/effort`; `⚡` in fast mode.
-- Context window bar. `cache cold` appears once the prompt cache has expired, meaning the next message re-processes the whole context.
+- Context window bar, then the prompt cache: `cache 42m/1h` is minutes left out of its lifetime (Claude Code uses either a 5-minute or a 1-hour cache). It turns yellow in the last fifth of the lifetime and becomes `cache cold/1h` once expired, meaning the next message re-processes the whole context. That costs about 12–20× a warm message's input, once.
 
 **Line 2:** 5-hour usage bar with the hour it resets │ weekly usage bar with the day and hour it resets.
 
@@ -38,12 +38,13 @@ Then in `~/.claude/settings.json`:
   "statusLine": {
     "type": "command",
     "command": "~/.claude/statusline.sh",
-    "padding": 2
+    "padding": 2,
+    "refreshInterval": 30
   }
 }
 ```
 
-Because it's a symlink, `git pull` updates the status line in every running session.
+`refreshInterval` redraws the line every 30 seconds so the cache countdown ticks while you're idle. Because the script is a symlink, `git pull` updates the status line in every running session.
 
 ## Preview
 

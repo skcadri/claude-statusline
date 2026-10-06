@@ -33,28 +33,30 @@ render() {
 
 render "new session (no API response yet, no shared cache)" '.'
 
-render "mid-session on main" '
+render "mid-session on main, 1h cache warm" '
   .context_window.used_percentage = 37.4
-  | .prompt_cache = {caching_observed: true, warm: true, expires_at: ($now + 2400)}
+  | .prompt_cache = {caching_observed: true, warm: true, ttl: "1h", expires_at: ($now + 2430)}
   | .rate_limits = {five_hour: {used_percentage: 7.0, resets_at: ($now + 10800)},
                     seven_day: {used_percentage: 23.0, resets_at: ($now + 345600)}}'
 
 render "new session in another tab (usage comes from the shared cache)" '.'
 
-render "worktree, PR approved, heavy usage, fast mode, cache gone cold" '
+render "worktree, PR approved, heavy usage, fast mode, 1h cache gone cold" '
   .workspace.current_dir = $dir + "/.claude/worktrees/fix-login"
   | .pr = {number: 42, url: "https://github.com/acme/demo/pull/42", review_state: "approved"}
   | .fast_mode = true
   | .context_window.used_percentage = 82
-  | .prompt_cache = {caching_observed: true, warm: false, expires_at: ($now - 60)}
+  | .prompt_cache = {caching_observed: true, warm: false, ttl: "1h", expires_at: ($now - 60)}
   | .rate_limits = {five_hour: {used_percentage: 86.2, resets_at: ($now + 10800)},
                     seven_day: {used_percentage: 63.0, resets_at: ($now + 345600)}}'
 
-render "subdirectory, PR changes requested, idle tab's stale 50% loses to 86%" '
+render "subdirectory, PR changes requested, 5m cache nearly cold, stale 50% ignored" '
   .workspace.current_dir = $dir + "/src"
   | .pr = {number: 43, url: "https://github.com/acme/demo/pull/43", review_state: "changes_requested"}
   | .context_window.used_percentage = 55
+  | .prompt_cache = {caching_observed: true, warm: true, ttl: "5m", expires_at: ($now + 45)}
   | .rate_limits = {five_hour: {used_percentage: 50.0, resets_at: ($now + 10800)}}'
 
-render "outside git, model without effort" '
-  .workspace.current_dir = "/tmp" | del(.effort) | .model.display_name = "Haiku 4.5"'
+render "outside git, model without effort, 5m cache warm" '
+  .workspace.current_dir = "/tmp" | del(.effort) | .model.display_name = "Haiku 4.5"
+  | .prompt_cache = {caching_observed: true, warm: true, ttl: "5m", expires_at: ($now + 200)}'

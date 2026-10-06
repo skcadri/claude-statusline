@@ -3,7 +3,7 @@
 # Claude Code Status Line
 # Based on https://gist.github.com/jtbr/4f99671d1cee06b44106456958caba8b
 #
-# Line 1: repo[/worktree][/subdir] · branch* ↑ahead ↓behind · PR · model + effort · context bar
+# Line 1: repo[/worktree][/subdir] · branch* ↑ahead ↓behind · PR · model + effort · context bar + cache countdown
 # Line 2: 5-hour and weekly usage bars with reset times
 #
 # Everything comes from the JSON Claude Code pipes on stdin plus two local git
@@ -43,7 +43,10 @@ eval "$(jq -r --argjson now "$now" --arg cached "$(cat "$LIMITS_FILE" 2>/dev/nul
     @sh "pr_number=\(.pr.number // "")",
     @sh "pr_url=\(.pr.url // "")",
     @sh "pr_state=\(.pr.review_state // "")",
-    @sh "cache_cold=\($pc.caching_observed == true and (($pc.warm == true and ($pc.expires_at // 0) > $now) | not))",
+    @sh "cache_left=\(if $pc.caching_observed != true then ""
+                      elif $pc.warm == true and ($pc.expires_at // 0) > $now then $pc.expires_at - $now | floor
+                      else 0 end)",
+    @sh "cache_ttl=\($pc.ttl // "")",
     @sh "usage_5h=\($lim.five_hour.used_percentage | pct)",
     @sh "resets_5h=\($lim.five_hour.resets_at // "")",
     @sh "usage_7d=\($lim.seven_day.used_percentage | pct)",
@@ -141,8 +144,27 @@ model_label="${model_name}${effort:+ ${DIM}${effort}${R}}"
 [ "$fast_mode" = "true" ] && model_label="${model_label} ${YELLOW}⚡${R}"
 
 ctx_info="$(color_for_pct "$context_pct")$(make_bar "$context_pct") ${context_pct}%${R}"
-# Cold cache: the next message re-processes the whole context.
-[ "$cache_cold" = "true" ] && ctx_info="${ctx_info} ${BLUE}cache cold${R}"
+# Prompt cache: time left out of its TTL (5m or 1h). Once cold, the next
+# message re-processes the whole context. The countdown only ticks with
+# statusLine.refreshInterval set in settings.json.
+if [ -n "$cache_left" ]; then
+  ttl="${cache_ttl:+/$cache_ttl}"
+  case "$cache_ttl" in
+    *h) ttl_s=$(( ${cache_ttl%h} * 3600 )) ;;
+    *m) ttl_s=$(( ${cache_ttl%m} * 60 )) ;;
+    *)  ttl_s=3600 ;;
+  esac
+  if [ "$cache_left" -le 0 ]; then
+    ctx_info="${ctx_info} ${BLUE}cache cold${ttl}${R}"
+  else
+    left="$(( cache_left / 60 ))m"
+    [ "$cache_left" -lt 60 ] && left="<1m"
+    # Last fifth of the TTL: reply soon or it goes cold.
+    color=$DIM
+    [ $(( cache_left * 5 )) -le "$ttl_s" ] && color=$YELLOW
+    ctx_info="${ctx_info} ${color}cache ${left}${ttl}${R}"
+  fi
+fi
 
 # ── Usage segments ───────────────────────────────────────────────────────────
 usage_parts=""
